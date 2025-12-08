@@ -9,10 +9,8 @@ from paddlex import create_pipeline
 # 1. 参数与配置
 ############################
 
-# 说明：多数 PaddleX/Cityscapes 风格推理输出为 trainId：
-#   road=0, sidewalk=1, person=11（注意：11 通常不是地面！）
-# 如为 labelId：road=7, sidewalk=8。请用 DEBUG_UNIQUE_IDS 检查后再调整。
-GROUND_IDS = [0, 1]  # 默认按 trainId：road, sidewalk
+# Cityscapes 中可行走地面的类别 id
+GROUND_IDS = [0, 1]  # 0: road, 1: sidewalk
 
 # 决策规则参数
 TH_GROUND = 0.15        # 地面比例阈值：大于这个值认为“这一块有明显地面”
@@ -25,9 +23,6 @@ STABLE_FRAMES = 1
 DATA_DIR = "data"   # 输入图片目录
 RES_DIR = "res"     # 输出结果目录
 
-# 调试配置
-DEBUG_UNIQUE_IDS = True   # 首张图打印 pred 的唯一类别 id，帮助确认 GROUND_IDS
-_printed_unique_once = False
 
 ############################
 # 2. PaddleX 模型加载
@@ -37,8 +32,6 @@ def load_seg_model(model_dir):
     """
     加载 PaddleX 导出的语义分割推理模型.
     model_dir: 推理模型目录，例如 'inference_model'
-    说明：部分 PaddleX 版本通过 create_pipeline 使用默认配置/环境加载，
-          如需显式加载本地导出模型，请在此处接入对应 API。
     """
     model = create_pipeline(pipeline="semantic_segmentation")
     return model
@@ -50,59 +43,6 @@ def get_ground_mask(pred):
     """
     ground_mask = np.isin(pred, GROUND_IDS)
     return ground_mask
-
-############################
-# 3. 分割结果后处理（增强版）
-############################
-
-def refine_ground_mask(mask, use_horizon=True, horizon_ratio=0.4, min_area_ratio=0.002):
-    """
-    通过更稳健的流程优化分割出的地面掩码：
-    - 位置先验：可选，清除上方（天空/建筑）区域
-    - 连通域去小区域：删除小于全图一定比例的噪点
-    - 自适应核开运算：去细碎噪声
-    - 自适应核闭运算：小幅填洞，避免过度连片
-    - 轻度中值滤波：平滑边缘
-    参数：
-      use_horizon: 是否使用地平线先验（建议 True）
-      horizon_ratio: 清除上方比例（例如 0.4 表示清除上方 40%）
-      min_area_ratio: 小连通域面积阈值占比（0.001~0.005 常用）
-    返回：bool 掩码
-    """
-    h, w = mask.shape
-    mask_uint8 = (mask.astype(np.uint8) * 255)
-
-    # 1) 位置先验：上方通常为天空/建筑，易误检为地面
-    if use_horizon and h > 0:
-        horizon = int(h * horizon_ratio)
-        horizon = np.clip(horizon, 0, h)
-        mask_uint8[:horizon, :] = 0
-
-    # 2) 去小连通域
-    if np.count_nonzero(mask_uint8) > 0:
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_uint8, connectivity=8)
-        min_area = max(1, int(h * w * float(min_area_ratio)))
-        keep = np.zeros_like(mask_uint8)
-        for i in range(1, num_labels):  # 跳过背景 0
-            if stats[i, cv2.CC_STAT_AREA] >= min_area:
-                keep[labels == i] = 255
-    else:
-        keep = mask_uint8
-
-    # 3) 自适应核大小（随分辨率变化），取奇数
-    k = max(3, int(min(h, w) * 0.01) | 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-
-    # 4) 开运算去细噪
-    opened = cv2.morphologyEx(keep, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    # 5) 闭运算小幅填洞
-    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    # 6) 轻度中值滤波
-    smoothed = cv2.medianBlur(closed, 3)
-
-    return smoothed > 0
 
 ############################
 # 4. 根据 ground_mask 计算决策点事件（单张图）
@@ -136,6 +76,9 @@ def detect_outdoor_events(ground_mask,
     gl = ratio(left)
     gc = ratio(center)
     gr = ratio(right)
+
+    # 可选：调参阶段可打印
+    # print(f"gl={gl:.2f}, gc={gc:.2f}, gr={gr:.2f}")
 
     straight = gc > th_ground
 
@@ -201,23 +144,6 @@ def overlay_ground_mask(image, ground_mask, alpha=0.4):
     return vis
 
 ############################
-# 6. 工具函数：确保 pred 与原图同尺寸
-############################
-
-def ensure_pred_size(pred, target_shape_hw):
-    """
-    若分割输出尺寸与原图不同，使用最近邻缩放到原图大小。
-    pred: HxW ndarray（int）
-    target_shape_hw: (H, W)
-    """
-    th, tw = target_shape_hw
-    ph, pw = pred.shape[:2]
-    if (ph, pw) != (th, tw):
-        pred_resized = cv2.resize(pred.astype(np.uint8), (tw, th), interpolation=cv2.INTER_NEAREST)
-        return pred_resized.astype(pred.dtype)
-    return pred
-
-############################
 # 7. 针对单张图片处理：推理 + 决策点 + 保存
 ############################
 
@@ -225,55 +151,37 @@ def process_single_image(model, img_path, save_dir):
     """
     对单张图片进行：
     1) 读取 & 分割
-    2) 结果后处理
-    3) 决策点识别
-    4) 若有决策点，则保存到 save_dir，文件名加上决策点类型
+    2) 决策点识别
+    3) 若有决策点，则保存到 save_dir，文件名加上决策点类型
     """
-    global _printed_unique_once
-
     img = cv2.imread(img_path)
     if img is None:
         print(f"[WARN] 读取失败: {img_path}")
         return
 
-    output = model.predict(input=img_path, target_size=-1)
-    pred = None
+    output=model.predict(input=img_path, target_size = -1)
     for res in output:
-        pred = res.json
-    pred = np.array(pred['res']['pred'][0])
-
+        pred =res.json
+    pred =np.array(pred['res']['pred'][0])
     if not isinstance(pred, np.ndarray) or pred.ndim != 2:
         print(f"[ERROR] 预测结果 pred 不是 HxW 的 np.ndarray，请检查 model.predict 的返回格式.")
         return
 
-    # 保证与原图一致大小
-    pred = ensure_pred_size(pred, img.shape[:2])
-
-    # 调试：打印一次唯一类别 id，帮助确认 GROUND_IDS 是否需要调整
-    if DEBUG_UNIQUE_IDS and not _printed_unique_once:
-        uniq = np.unique(pred)
-        print(f"[DEBUG] {os.path.basename(img_path)} unique class ids: {uniq}")
-        print(f"[DEBUG] 当前 GROUND_IDS = {GROUND_IDS} （如果不匹配，请根据模型映射修改）")
-        _printed_unique_once = True
-
-    # ---------- 2. 获取原始地面 mask ----------
+    # ---------- 2. 获取地面 mask ----------
     ground_mask = get_ground_mask(pred)
 
-    # ---------- 3. 后处理，优化 mask ----------
-    refined_mask = refine_ground_mask(ground_mask, use_horizon=True, horizon_ratio=0.4, min_area_ratio=0.002)
-
-    # ---------- 4. 基于优化后的 mask 检测决策点 ----------
-    events = detect_outdoor_events(refined_mask)
+    # ---------- 3. 检测决策点 ----------
+    events = detect_outdoor_events(ground_mask)
 
     if not events:
         # 没有任何决策点，就不保存（根据你需求可改为仍然保存）
         print(f"[INFO] {os.path.basename(img_path)} 未识别到决策点，跳过保存")
         return
 
-    # ---------- 5. 叠加可视化（使用优化后的 mask） ----------
-    vis = overlay_ground_mask(img, refined_mask)
+    # ---------- 4. 叠加可视化（可选） ----------
+    vis = overlay_ground_mask(img, ground_mask)
 
-    # 在图像上写上事件文字方便调试
+    # 也可以在图像上写上事件文字方便调试
     y0 = 30
     for event in events:
         tag = event_to_tag(event)
@@ -282,7 +190,7 @@ def process_single_image(model, img_path, save_dir):
                     lineType=cv2.LINE_AA)
         y0 += 40
 
-    # ---------- 6. 拼接输出文件名 ----------
+    # ---------- 5. 拼接输出文件名 ----------
     base_name = os.path.basename(img_path)
     name, ext = os.path.splitext(base_name)
 
@@ -294,13 +202,14 @@ def process_single_image(model, img_path, save_dir):
     os.makedirs(save_dir, exist_ok=True)
     out_path = os.path.join(save_dir, out_name)
 
-    # ---------- 7. 保存结果图 ----------
+    # ---------- 6. 保存结果图 ----------
     cv2.imwrite(out_path, vis)
     print(f"[SAVE] {out_path}")
 
 
+
 def main():
-    model_dir = "inference_model"  # TODO: 如需显式加载本地导出的推理模型，请在 load_seg_model 中接入
+    model_dir = "inference_model"  # TODO: 改成你的推理模型路径
     model = load_seg_model(model_dir)
 
     os.makedirs(RES_DIR, exist_ok=True)
@@ -322,3 +231,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
