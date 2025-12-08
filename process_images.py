@@ -2,6 +2,7 @@ import os
 import cv2
 import numpy as np
 import time
+import tempfile
 from collections import deque
 from paddlex import create_pipeline
 
@@ -92,6 +93,28 @@ def simple_refine_ground_mask(ground_mask_bool,
     # 轻微平滑边界
     keep = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, kernel, iterations=1)
     return (keep > 0)
+
+
+def predict_label_map(model, inp):
+    """
+    统一包装预测，输入路径或numpy图像，返回HxW标签图
+    """
+    output = model.predict(input=inp, target_size=-1)
+    for res in output:
+        pred_json = res.json
+    return np.array(pred_json['res']['pred'][0])
+
+
+def recover_thin_structures(raw_mask_bool, refined_mask_bool, k=3):
+    """
+    从原始mask中“补回”与精炼结果相邻的细长结构，提升召回。
+    仅恢复与精炼结果接触(经一次膨胀后)的细条，避免大面积回流。
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    raw_d = cv2.dilate(raw_mask_bool.astype(np.uint8), kernel, iterations=1) > 0
+    ref_d = cv2.dilate(refined_mask_bool.astype(np.uint8), kernel, iterations=1) > 0
+    recovered = raw_d & ref_d & (~refined_mask_bool)
+    return refined_mask_bool | recovered
 
 ############################
 # 4. 根据 ground_mask 计算决策点事件（单张图）
@@ -217,12 +240,23 @@ def process_single_image(model, img_path, save_dir):
         return
 
     # ---------- 2. 获取地面 mask ----------
+    raw_ground = get_ground_mask(pred)
+    # 水平翻转TTA：翻转图像预测，再翻回
+    img_flip = cv2.flip(img, 1)
+    pred_flip = predict_label_map(model, img_flip)
+    pred_flip = np.fliplr(pred_flip)
+    ground_flip = get_ground_mask(pred_flip)
+    # 并集提升召回
+    ground_or = (raw_ground | ground_flip)
     ground_mask = simple_refine_ground_mask(
-        get_ground_mask(pred),
+        ground_or,
         kernel_rel=0.008,
         min_area_ratio=0.0005,
-        keep_only_bottom_connected=True
+        keep_only_bottom_connected=False
     )
+
+    # 从原始mask（含翻转并集）回补与精炼结果相邻的细长结构，提高召回
+    ground_mask = recover_thin_structures(ground_or, ground_mask, k=3)
 
     # ---------- 3. 检测决策点 ----------
     events = detect_outdoor_events(ground_mask)
