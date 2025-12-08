@@ -44,6 +44,55 @@ def get_ground_mask(pred):
     ground_mask = np.isin(pred, GROUND_IDS)
     return ground_mask
 
+def simple_refine_ground_mask(ground_mask_bool,
+                              kernel_rel=0.01,
+                              min_area_ratio=0.001,
+                              keep_only_bottom_connected=True):
+    """
+    ground_mask_bool: HxW 的bool初始地面掩码
+    kernel_rel: 形态学核大小相对最短边的比例(0.008~0.02常用)
+    min_area_ratio: 连通域最小面积占比(0.0005~0.003常用)
+    keep_only_bottom_connected: 仅保留与底边相连的连通域
+    """
+    H, W = ground_mask_bool.shape
+    b = (ground_mask_bool.astype(np.uint8) * 255)
+
+    # 形态学：先闭后开（填缝、去小噪）
+    k = max(3, int(min(H, W) * float(kernel_rel)))
+    if k % 2 == 0:
+        k += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    b = cv2.morphologyEx(b, cv2.MORPH_CLOSE, kernel, iterations=1)
+    b = cv2.morphologyEx(b, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # 连通域过滤
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((b > 0).astype(np.uint8), connectivity=8)
+    if num <= 1:
+        return (b > 0)
+
+    area_th = H * W * float(min_area_ratio)
+    keep = np.zeros((H, W), dtype=np.uint8)
+
+    # 与底边相连判定
+    def touches_bottom(lbl_id):
+        return np.any(labels[-1, :] == lbl_id) or np.any(labels[-2, :] == lbl_id)
+
+    kept_ids = []
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] >= area_th:
+            if not keep_only_bottom_connected or touches_bottom(i):
+                keep[labels == i] = 255
+                kept_ids.append(i)
+
+    # 如果严格与底边相连后一个都没保留，兜底保留最大连通域
+    if keep_only_bottom_connected and len(kept_ids) == 0:
+        i = np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1
+        keep[labels == i] = 255
+
+    # 轻微平滑边界
+    keep = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return (keep > 0)
+
 ############################
 # 4. 根据 ground_mask 计算决策点事件（单张图）
 ############################
@@ -168,7 +217,12 @@ def process_single_image(model, img_path, save_dir):
         return
 
     # ---------- 2. 获取地面 mask ----------
-    ground_mask = get_ground_mask(pred)
+    ground_mask = simple_refine_ground_mask(
+        get_ground_mask(pred),
+        kernel_rel=0.01,
+        min_area_ratio=0.001,
+        keep_only_bottom_connected=True
+    )
 
     # ---------- 3. 检测决策点 ----------
     events = detect_outdoor_events(ground_mask)
