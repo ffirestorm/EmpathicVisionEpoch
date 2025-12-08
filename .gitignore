@@ -2,6 +2,7 @@
 data/
 res/
 inference_model/
+data25.11.26
 
 # Python
 __pycache__/
@@ -75,4 +76,5 @@ Thumbs.db
 *.csv
 *.json
 output/
+res/
 
