@@ -10,7 +10,7 @@ from paddlex import create_pipeline
 ############################
 
 # Cityscapes 中可行走地面的类别 id
-GROUND_IDS = [0, 1]  # 0: road, 1: sidewalk
+GROUND_IDS = [0, 1, 9]  # 0: road, 1: sidewalk
 
 # 决策规则参数
 TH_GROUND = 0.15        # 地面比例阈值：大于这个值认为“这一块有明显地面”
