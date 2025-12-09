@@ -15,9 +15,11 @@ GROUND_IDS = [0, 1]  # 0: road, 1: sidewalk
 # 决策规则参数
 TH_GROUND = 0.15        # 地面比例阈值：大于这个值认为“这一块有明显地面”
 DELTA_SIDE = 0.10       # 左右地面比例差值，大于此认定为“多出一侧通路”
-HOLE_MAX_AREA_RATIO = 0.0015   # 填充地面内的小空洞(如树叶)的最大面积占整幅图比例
+HOLE_MAX_AREA_RATIO = 0.0030   # 填充地面内的小空洞(如树叶)的最大面积占整幅图比例（增大以抑制砖缝造成的小洞）
 OBS_MIN_AREA_RATIO = 0.01      # 认为是“脚下中央障碍”所需的最小面积(相对ROI面积)
 OBS_MIN_WIDTH_RATIO = 0.06     # 认为是“脚下中央障碍”所需的最小水平宽度(相对整图宽度)
+THIN_MIN_DIM_RATIO = 0.012     # 将“很细的非地面裂缝”视作噪声的最小短边阈值(相对短边)
+THIN_ASPECT_MIN = 6.0          # 长细条的最小纵横比，超过则视作裂缝
 
 # 判定稳定事件所需的帧数（这里只处理单张图片，可设为 1）
 STABLE_FRAMES = 1
@@ -115,6 +117,65 @@ def simple_refine_ground_mask(ground_mask_bool,
 ############################
 # 4. 根据 ground_mask 计算决策点事件（单张图）
 ############################
+
+def suppress_thin_cracks(ground_mask,
+                         thin_min_dim_ratio=THIN_MIN_DIM_RATIO,
+                         thin_aspect_min=THIN_ASPECT_MIN,
+                         thin_max_area_ratio=0.03,
+                         roi_top_rel=0.4):
+    """
+    针对砖缝/裂缝：
+    - 在 ROI 内把“很细且很长”的非地面连通域当作裂缝噪声，填回地面。
+    条件：min(width,height) < thin_min_dim_ratio*短边 且 长宽比>thin_aspect_min 且 面积不大。
+    """
+    H, W = ground_mask.shape
+    top = int(H * float(roi_top_rel))
+    roi = ground_mask[top:, :].copy()
+
+    ng = (~roi).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(ng, connectivity=8)
+    if num <= 1:
+        return ground_mask
+
+    min_dim_th = min(H, W) * float(thin_min_dim_ratio)
+    max_area_th = H * W * float(thin_max_area_ratio)
+
+    for i in range(1, num):
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        area = stats[i, cv2.CC_STAT_AREA]
+        minor = min(w, h)
+        major = max(w, h)
+        aspect = major / (max(1.0, float(minor)))
+        if (minor < min_dim_th) and (aspect >= float(thin_aspect_min)) and (area < max_area_th):
+            roi[labels == i] = True
+
+    out = ground_mask.copy()
+    out[top:, :] = roi
+    return out
+
+
+def strengthen_bottom_close(ground_mask,
+                            kernel_rel_bottom=0.016,
+                            roi_top_rel=0.55,
+                            iterations=1):
+    """
+    只在下半部分进行更强的闭运算，填补因砖缝产生的细小断裂。
+    """
+    H, W = ground_mask.shape
+    top = int(H * float(roi_top_rel))
+    roi = (ground_mask[top:, :].astype(np.uint8) * 255)
+
+    k = max(3, int(min(H, W) * float(kernel_rel_bottom)))
+    if k % 2 == 0:
+        k += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, kernel, iterations=iterations)
+
+    out = ground_mask.copy()
+    out[top:, :] = (roi > 0)
+    return out
+
 
 def suppress_small_roi_obstacles(ground_mask,
                                  obs_min_area_ratio=0.01,
@@ -278,13 +339,30 @@ def process_single_image(model, img_path, save_dir):
     # ---------- 2. 获取地面 mask ----------
     ground_mask = simple_refine_ground_mask(
         get_ground_mask(pred),
-        kernel_rel=0.008,
+        kernel_rel=0.010,                 # 稍微加大闭/开核，弥合砖缝
         min_area_ratio=0.0005,
         keep_only_bottom_connected=True,
         hole_max_area_ratio=HOLE_MAX_AREA_RATIO
     )
 
-    # 针对事件检测：抑制 ROI 内很小且很窄的“非地面”斑块（如树叶）
+    # 仅在下半部分做更强闭运算，进一步抑制细裂缝
+    ground_mask = strengthen_bottom_close(
+        ground_mask,
+        kernel_rel_bottom=0.016,
+        roi_top_rel=0.55,
+        iterations=1
+    )
+
+    # 将“细长非地面连通域”视为裂缝并回填为地面
+    ground_mask = suppress_thin_cracks(
+        ground_mask,
+        thin_min_dim_ratio=THIN_MIN_DIM_RATIO,
+        thin_aspect_min=THIN_ASPECT_MIN,
+        thin_max_area_ratio=0.03,
+        roi_top_rel=0.4
+    )
+
+    # 针对事件检测：抑制 ROI 内很小且很窄的“非地面”斑块（如树叶/小坑）
     ground_mask_evt = suppress_small_roi_obstacles(
         ground_mask,
         obs_min_area_ratio=OBS_MIN_AREA_RATIO,
