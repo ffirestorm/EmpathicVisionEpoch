@@ -34,10 +34,44 @@ RES_DIR = "res"     # 输出结果目录
 def load_seg_model(model_dir):
     """
     加载 PaddleX 导出的语义分割推理模型.
-    model_dir: 推理模型目录，例如 'inference_model'
+    model_dir: 推理模型目录，例如 'inference_model/OCRNet_HRNet-W48_infer'
+
+    兼容不同 PaddleX 版本的入参：优先尝试 model，其次 model_dir，最后使用配置文件 config。
+    支持自动在 model_dir 下寻找常见的推理配置文件名。
     """
-    model = create_pipeline(pipeline="semantic_segmentation")
-    return model
+    # 优先尝试直接传目录
+    try:
+        return create_pipeline(pipeline="semantic_segmentation", model=model_dir)
+    except TypeError:
+        pass
+    try:
+        return create_pipeline(pipeline="semantic_segmentation", model_dir=model_dir)
+    except TypeError:
+        pass
+
+    # 使用配置文件路径
+    possible_cfgs = [
+        os.path.join(model_dir, "inference.yml"),
+        os.path.join(model_dir, "deploy.yaml"),
+        os.path.join(model_dir, "pipeline.yaml"),
+        os.path.join(model_dir, "infer_cfg.yml"),
+        os.path.join(model_dir, "inference.json"),  # 个别版本也支持 json
+    ]
+    for cfg in possible_cfgs:
+        if os.path.exists(cfg):
+            try:
+                return create_pipeline(pipeline="semantic_segmentation", config=cfg)
+            except TypeError:
+                # 有的版本参数名可能叫 pipeline_config
+                try:
+                    return create_pipeline(pipeline="semantic_segmentation", pipeline_config=cfg)
+                except TypeError:
+                    continue
+
+    raise RuntimeError(
+        f"无法加载 PaddleX 语义分割模型，请检查你的 PaddleX 版本与导出目录是否完整: {model_dir}"
+    )
+
 
 def get_ground_mask(pred):
     """
@@ -46,6 +80,7 @@ def get_ground_mask(pred):
     """
     ground_mask = np.isin(pred, GROUND_IDS)
     return ground_mask
+
 
 def simple_refine_ground_mask(ground_mask_bool,
                               kernel_rel=0.008,
@@ -156,6 +191,7 @@ def suppress_small_roi_obstacles(ground_mask,
     out[top:, :] = roi
     return out
 
+
 def detect_outdoor_events(ground_mask,
                           th_ground=TH_GROUND,
                           delta_side=DELTA_SIDE):
@@ -237,6 +273,7 @@ def event_to_tag(event):
         return "OBSTACLE_CENTER_BYPASSABLE"
     return "UNKNOWN"
 
+
 def overlay_ground_mask(image, ground_mask, alpha=0.4):
     """
     将地面区域以半透明绿色覆盖到原图上，帮助可视化。
@@ -250,6 +287,97 @@ def overlay_ground_mask(image, ground_mask, alpha=0.4):
         vis, 1 - alpha, green, alpha, 0
     )[mask_3c]
     return vis
+
+
+############################
+# 6. 解析 PaddleX predict 输出为 HxW 类别图
+############################
+
+def _to_hxw_pred_array(data):
+    """将多种可能的数据结构转换为 HxW 的 np.ndarray(int)。失败则抛错。"""
+    arr = None
+    # 常见：list[list[...] ] 或 np.ndarray
+    if isinstance(data, np.ndarray):
+        arr = data
+    else:
+        try:
+            arr = np.array(data)
+        except Exception:
+            arr = None
+    if arr is None:
+        raise ValueError("无法将预测结果转换为 ndarray")
+
+    # 兼容可能的形状： (H,W), (1,H,W), (H,W,1)
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+    if arr.ndim != 2:
+        raise ValueError(f"预测数组维度不为2，实际形状: {arr.shape}")
+
+    if not np.issubdtype(arr.dtype, np.integer):
+        arr = arr.astype(np.int32)
+    return arr
+
+
+def parse_pred_from_output(output):
+    """
+    尝试从 PaddleX pipeline 的 predict 返回结果中解析出 HxW 的类别图。
+    兼容多种字段命名：'res'/'result' 下的 'pred'/'label_map'/'seg_map' 等。
+    """
+    # 取到一个 dict
+    data = None
+    # 1) output 可能是迭代器/列表，元素带 .json
+    try:
+        for res in output:
+            if hasattr(res, 'json'):
+                data = res.json
+                break
+    except TypeError:
+        # output 不可迭代
+        pass
+
+    # 2) 如果没取到，可能本身就是 dict
+    if data is None and isinstance(output, dict):
+        data = output
+
+    if data is None:
+        raise ValueError("无法从 predict 的输出中获取字典数据，请打印 output 检查具体结构")
+
+    # 常见结构 1： data['res']['pred'][0]
+    try:
+        if 'res' in data and isinstance(data['res'], dict) and 'pred' in data['res']:
+            return _to_hxw_pred_array(data['res']['pred'][0])
+    except Exception:
+        pass
+
+    # 常见结构 2： data['result']['label_map'] 或 ['pred'] 或 ['seg_map']
+    if 'result' in data and isinstance(data['result'], dict):
+        cand_keys = ['label_map', 'pred', 'seg_map']
+        for k in cand_keys:
+            if k in data['result']:
+                try:
+                    v = data['result'][k]
+                    # 有些会是 [HxW] 或 [[HxW]]
+                    if isinstance(v, list) and len(v) == 1:
+                        v = v[0]
+                    return _to_hxw_pred_array(v)
+                except Exception:
+                    continue
+
+    # 常见结构 3： 顶层就有 'pred'/'label_map'/'seg_map'
+    for k in ['pred', 'label_map', 'seg_map']:
+        if k in data:
+            v = data[k]
+            if isinstance(v, list) and len(v) == 1:
+                v = v[0]
+            return _to_hxw_pred_array(v)
+
+    # 若仍未解析成功，抛出并让用户打印 data
+    raise KeyError(
+        f"未能在 predict 返回中找到可用的类别图字段，可用键: {list(data.keys())}"
+    )
+
 
 ############################
 # 7. 针对单张图片处理：推理 + 决策点 + 保存
@@ -267,10 +395,30 @@ def process_single_image(model, img_path, save_dir):
         print(f"[WARN] 读取失败: {img_path}")
         return
 
-    output=model.predict(input=img_path, target_size = -1)
-    for res in output:
-        pred =res.json
-    pred =np.array(pred['res']['pred'][0])
+    output = model.predict(input=img_path, target_size=-1)
+
+    try:
+        pred = parse_pred_from_output(output)
+    except Exception as e:
+        print("[ERROR] 解析预测结果失败: ", repr(e))
+        # 尝试打印一次结构帮助定位
+        try:
+            # 尽量安全地探查一下返回结构
+            preview = None
+            try:
+                # 取一个元素看看
+                for res in output:
+                    if hasattr(res, 'json'):
+                        preview = list(res.json.keys()) if isinstance(res.json, dict) else type(res.json)
+                        break
+            except TypeError:
+                if isinstance(output, dict):
+                    preview = list(output.keys())
+            print("[DEBUG] predict 返回预览: ", preview)
+        except Exception:
+            pass
+        return
+
     if not isinstance(pred, np.ndarray) or pred.ndim != 2:
         print(f"[ERROR] 预测结果 pred 不是 HxW 的 np.ndarray，请检查 model.predict 的返回格式.")
         return
@@ -330,7 +478,8 @@ def process_single_image(model, img_path, save_dir):
 
 
 def main():
-    model_dir = "inference_model"  # TODO: 改成你的推理模型路径
+    # 使用你本地的推理模型目录（用户提供）
+    model_dir = "inference_model/OCRNet_HRNet-W48_infer"  # 可改为绝对路径
     model = load_seg_model(model_dir)
 
     os.makedirs(RES_DIR, exist_ok=True)
@@ -352,4 +501,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
