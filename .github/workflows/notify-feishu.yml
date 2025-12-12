@@ -12,9 +12,9 @@ jobs:
     steps:
       - name: Send Feishu Notification
         run: |
-          MESSAGE="🔔 仓库更新：${{ github.repository }}%0A\
-          👤 提交者：${{ github.actor }}%0A\
-          📄 分支：${{ github.ref_name }}%0A\
+          MESSAGE="🔔 仓库更新：${{ github.repository }}\n\
+          👤 提交者：${{ github.actor }}\n\
+          📄 分支：${{ github.ref_name }}\n\
           📝 提交信息：${{ github.event.head_commit.message }}"
 
           curl -X POST \
